@@ -4,3 +4,5 @@ daily_features_with_regimes.parquet
 tuner_dir/
 spy/
 qqq/
+__pycache__/
+.ipynb_checkpoints/
