@@ -8,3 +8,6 @@ __pycache__/
 .ipynb_checkpoints/
 models/
 tbills/
+qqq_features_parquet/
+spy_features_parquet/
+*.parquet
