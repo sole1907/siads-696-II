@@ -11,3 +11,5 @@ tbills/
 qqq_features_parquet/
 spy_features_parquet/
 *.parquet
+venv
+*.png

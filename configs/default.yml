@@ -1,0 +1,33 @@
+paths:
+  lake_root: "s3://my-bucket/econclust"
+  local_root: "./artifacts"
+  input_parquet: "s3://my-bucket/econclust/spy_historical_2005_2023.parquet"
+  output_prefix: "SPY"
+
+params:
+  features:
+    - impl_volatility
+    - delta
+    - theta
+    - vega
+    - moneyness
+    - volume
+    - open_interest
+    - vol
+    - volume_ma5
+    - prc
+    - price_diff_1d
+    - price_diff_2d
+    - price_diff_3d
+    - price_diff_5d
+    - price_diff_8d
+    - price_diff_34d
+  date_col: date
+  pca_variance: 0.95
+  scan_max_cap: 20
+  n_jobs: 8
+  silhouette_sample_size: 5000
+  minibatch_iter: 100
+  stability_bootstraps: 6
+  stability_sample_frac: 0.8
+  final_kmeans_n_init: 20

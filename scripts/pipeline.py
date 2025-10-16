@@ -1,0 +1,237 @@
+#!/usr/bin/env python
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import argparse
+import logging
+import os
+
+import numpy as np
+import polars as pl
+
+from econclust import (
+    load_config,
+    _prep_features,
+    apply_pca_preprocessing,
+    auto_k_range,
+    scan_kmeans,
+    scan_ward,
+    optimize_w_weights_by_stability_fast,
+    optimize_w_weights_by_stability_ward,
+    cluster_from_X,
+    write_parquet_fs,
+    lake_to_local,
+)
+from econclust.viz import plot_k_scan_to_fs, plot_ward_scan_to_fs
+
+# --------------------
+# Logging & path utils
+# --------------------
+def setup_logging(level: str = "INFO") -> None:
+    logging.basicConfig(
+        level=getattr(logging, level.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+
+
+def ensure_dir(p: Path) -> Path:
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def resolve_out_paths(lake_root: str, local_root: str, run_name: str | None = None):
+    """
+    Returns (lake_plots_dir, local_frames_dir, lake_frames_dir) with directories created.
+    - lake_plots_dir:  <lake_root>/plots[/run_name]
+    - local_frames_dir: <local_root>[/run_name]
+    - lake_frames_dir:  <lake_root>/frames[/run_name]
+    """
+    lake_root = Path(lake_root).resolve()
+    local_root = Path(local_root).resolve()
+
+    lake_plots = ensure_dir(lake_root / "plots")
+    lake_frames = ensure_dir(lake_root / "frames")
+    local_frames = ensure_dir(local_root)
+
+    if run_name:
+        lake_plots = ensure_dir(lake_plots / run_name)
+        lake_frames = ensure_dir(lake_frames / run_name)
+        local_frames = ensure_dir(local_frames / run_name)
+
+    return lake_plots, local_frames, lake_frames
+
+
+# -------------
+# Main pipeline
+# -------------
+def main():
+    ap = argparse.ArgumentParser(description="Unified clustering pipeline")
+    ap.add_argument("--config", type=str, default="configs/default.yml")
+    ap.add_argument("--algo", choices=["kmeans", "ward", "both"], default="both")
+    ap.add_argument("--input", type=str, default=None, help="Input parquet file")
+    ap.add_argument("--features", nargs='+', default=None, help="Feature columns")
+    ap.add_argument("--pca", type=float, default=None, help="PCA variance (e.g. 0.95)")
+    ap.add_argument("--standardize", type=str, default=None, help="Standardize features (true/false)")
+    ap.add_argument("--lake-root", type=str, default=None, help="Lake root directory")
+    ap.add_argument("--local-root", type=str, default=None, help="Local output directory")
+    ap.add_argument("--k-max", type=int, default=None, help="Max k for scan")
+    ap.add_argument("--n-jobs", type=int, default=None, help="Number of jobs")
+    ap.add_argument("--silh-cap", type=int, default=None, help="Silhouette sample size cap")
+    ap.add_argument("--export-plots", action="store_true", help="Export plots")
+    ap.add_argument("--export-frame", action="store_true", help="Export clustered frame")
+    ap.add_argument("--use-pca", action="store_true", help="Run PCA and cluster on PCA space (legacy)")
+    ap.add_argument("--thresholds", type=str, default="30,40,50,60,70,80,90,100", help="Ward thresholds CSV")
+    ap.add_argument("--run-name", type=str, default=None, help="Optional run name (subfolder for outputs)")
+    ap.add_argument("--log-level", type=str, default="INFO", help="DEBUG|INFO|WARNING|ERROR")
+    args = ap.parse_args()
+
+    setup_logging(args.log_level)
+
+    cfg = load_config(args.config)
+    paths, P = cfg.paths, cfg.params
+
+    # Override config with CLI args if provided
+    input_parquet = args.input if args.input else paths.input_parquet
+    features = args.features if args.features else P.features
+    pca_variance = args.pca if args.pca is not None else P.pca_variance
+    standardize = args.standardize.lower() == "true" if args.standardize is not None else True
+    lake_root = args.lake_root if args.lake_root else paths.lake_root
+    local_root = args.local_root if args.local_root else paths.local_root
+    k_max = args.k_max if args.k_max is not None else P.scan_max_cap
+    n_jobs = args.n_jobs if args.n_jobs is not None else P.n_jobs
+    silh_cap = args.silh_cap if args.silh_cap is not None else P.silhouette_sample_size
+
+    # Resolve output dirs (create if missing)
+    lake_plots_dir, local_frames_dir, lake_frames_dir = resolve_out_paths(
+        lake_root, local_root, args.run_name
+    )
+
+    # Basic environment info
+    logging.info("CWD: %s", os.getcwd())
+    logging.info("Config loaded: %s", args.config)
+    logging.info("Algo: %s | use_pca: %s | thresholds: %s", args.algo, args.use_pca, args.thresholds)
+
+    # Input existence check
+    in_path = Path(input_parquet)
+    if not in_path.exists():
+        raise FileNotFoundError(f"Input parquet not found: {in_path.resolve()}")
+    logging.info("Reading: %s", in_path.resolve())
+
+    # Load
+    df = pl.read_parquet(str(in_path))
+    logging.info("Input shape: rows=%d, cols=%d", df.height, len(df.columns))
+
+    # Columns check
+    feat_cols = list(features)
+    missing = [c for c in feat_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required feature columns: {missing}")
+
+    # 1) Optional PCA
+    if args.use_pca or args.pca is not None:
+        df, pca, feat_cols = apply_pca_preprocessing(df, features, n_components=pca_variance)
+        # When using PCA, features are already standardized for the PCA step; don't re-standardize for X
+        standardize_for_X = False
+        suffix = "pca"
+    else:
+        standardize_for_X = standardize
+        suffix = "raw"
+
+    X = _prep_features(df, feat_cols, standardize=standardize_for_X)
+    logging.info("Feature matrix X: shape=%s, dtype=%s", X.shape, X.dtype)
+
+    # Output base names
+    base = f"{paths.output_prefix}_{suffix}"
+
+    # Pre-build file paths
+    lake_plot_kmeans = lake_plots_dir / f"{base}_kmeans_scan.png"
+    lake_plot_ward = lake_plots_dir / f"{base}_ward_scan.png"
+
+    lake_parquet_kmeans = lake_frames_dir / f"{base}_kmeans.parquet"
+    lake_parquet_ward = lake_frames_dir / f"{base}_ward.parquet"
+
+    local_parquet_kmeans = local_frames_dir / f"{base}_kmeans.parquet"
+    local_parquet_ward = local_frames_dir / f"{base}_ward.parquet"
+
+    # ----------------
+    # KMeans pipeline
+    # ----------------
+    if args.algo in ("kmeans", "both"):
+        logging.info("[KMeans] Auto-selecting k-range...")
+        k_range = auto_k_range(df, feat_cols, max_cap=k_max)
+
+        logging.info("[KMeans] Scanning k over %s", list(k_range))
+        res_km = scan_kmeans(
+            df=None,
+            feature_cols=None,
+            X=X,
+            k_range=k_range,
+            n_jobs=n_jobs,
+            silhouette_sample_size=silh_cap,
+            use_minibatch=True,
+            mbk_max_iter=P.minibatch_iter,
+        )
+
+        logging.info("[KMeans] Optimizing weights via stability...")
+        a, b, k_star, info = optimize_w_weights_by_stability_fast(
+            ks=list(res_km.ks),
+            res=res_km,
+            X=X,
+            n_init=P.final_kmeans_n_init,
+            bootstraps=P.stability_bootstraps,
+            sample_frac=P.stability_sample_frac,
+            n_jobs_stability=n_jobs,
+        )
+        k_final = int(k_star)
+        logging.info("[KMeans] Final k = %d (mean ARI=%.4f)", k_final, info["best"]["score"])
+
+        # Final fit
+        out_km = cluster_from_X(X, df, method="kmeans", n_clusters=k_final, n_init=P.final_kmeans_n_init)
+
+        # Save to lake, copy to local
+        write_parquet_fs(out_km, str(lake_parquet_kmeans))
+        lake_to_local(str(lake_parquet_kmeans), str(local_parquet_kmeans))
+        logging.info("Saved clustered frame → lake=%s | local=%s", lake_parquet_kmeans, local_parquet_kmeans)
+
+        # Plots → lake + local (helper saves both)
+        plot_k_scan_to_fs(res_km, str(lake_plot_kmeans), str(lake_plot_kmeans).replace(str(lake_plots_dir), str(lake_plots_dir)))
+        logging.info("Saved KMeans scan plot → %s", lake_plot_kmeans)
+
+    # ---------------
+    # Ward pipeline
+    # ---------------
+    if args.algo in ("ward", "both"):
+        thresholds = [float(x) for x in args.thresholds.split(",") if x.strip()]
+        logging.info("[Ward] Scanning thresholds: %s", thresholds)
+
+        res_w = scan_ward(X, thresholds, sample_size=silh_cap)
+
+        logging.info("[Ward] Optimizing weights via stability...")
+        a, b, t_star, info_w = optimize_w_weights_by_stability_ward(
+            thresholds=thresholds,
+            res=res_w,
+            X=X,
+            bootstraps=P.stability_bootstraps,
+            sample_frac=P.stability_sample_frac,
+            n_jobs_stability=n_jobs,
+        )
+        t_final = float(t_star)
+        logging.info("[Ward] Final threshold = %.4f (mean ARI=%.4f)", t_final, info_w["best"]["score"])
+
+        out_w = cluster_from_X(X, df, method="ward", ward_threshold=t_final)
+
+        # Save to lake, copy to local
+        write_parquet_fs(out_w, str(lake_parquet_ward))
+        lake_to_local(str(lake_parquet_ward), str(local_parquet_ward))
+        logging.info("Saved clustered frame → lake=%s | local=%s", lake_parquet_ward, local_parquet_ward)
+
+        # Plots → lake + local
+        plot_ward_scan_to_fs(res_w, str(lake_plot_ward), str(lake_plot_ward).replace(str(lake_plots_dir), str(lake_plots_dir)))
+        logging.info("Saved Ward scan plot → %s", lake_plot_ward)
+
+    logging.info("DONE.")
+
+
+if __name__ == "__main__":
+    main()
