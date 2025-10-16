@@ -9,6 +9,7 @@ import os
 
 import numpy as np
 import polars as pl
+import pandas as pd
 
 from econclust import (
     load_config,
@@ -23,7 +24,7 @@ from econclust import (
     write_parquet_fs,
     lake_to_local,
 )
-from econclust.viz import plot_k_scan_to_fs, plot_ward_scan_to_fs
+from econclust.viz import plot_k_scan_to_fs, plot_ward_scan_to_fs, plot_dendrogram_to_fs, export_comparison_summary_and_plots
 
 # --------------------
 # Logging & path utils
@@ -42,24 +43,27 @@ def ensure_dir(p: Path) -> Path:
 
 def resolve_out_paths(lake_root: str, local_root: str, run_name: str | None = None):
     """
-    Returns (lake_plots_dir, local_frames_dir, lake_frames_dir) with directories created.
+    Returns (lake_plots_dir, local_frames_dir, lake_frames_dir, local_frames_dir) with directories created.
     - lake_plots_dir:  <lake_root>/plots[/run_name]
-    - local_frames_dir: <local_root>[/run_name]
+    - local_frames_dir: <local_root>/frames[/run_name]
     - lake_frames_dir:  <lake_root>/frames[/run_name]
+    - local_plots_dir:  <local_root>/plots[/run_name]
     """
     lake_root = Path(lake_root).resolve()
     local_root = Path(local_root).resolve()
 
     lake_plots = ensure_dir(lake_root / "plots")
     lake_frames = ensure_dir(lake_root / "frames")
-    local_frames = ensure_dir(local_root)
+    local_plots = ensure_dir(local_root / "plots")
+    local_frames = ensure_dir(local_root / "frames")
 
     if run_name:
         lake_plots = ensure_dir(lake_plots / run_name)
         lake_frames = ensure_dir(lake_frames / run_name)
         local_frames = ensure_dir(local_frames / run_name)
+        local_plots = ensure_dir(local_plots / run_name)
 
-    return lake_plots, local_frames, lake_frames
+    return lake_plots, local_frames, lake_frames, local_plots
 
 
 # -------------
@@ -103,7 +107,7 @@ def main():
     silh_cap = args.silh_cap if args.silh_cap is not None else P.silhouette_sample_size
 
     # Resolve output dirs (create if missing)
-    lake_plots_dir, local_frames_dir, lake_frames_dir = resolve_out_paths(
+    lake_plots_dir, local_frames_dir, lake_frames_dir, local_plots_dir  = resolve_out_paths(
         lake_root, local_root, args.run_name
     )
 
@@ -130,6 +134,7 @@ def main():
 
     # 1) Optional PCA
     if args.use_pca or args.pca is not None:
+        
         df, pca, feat_cols = apply_pca_preprocessing(df, features, n_components=pca_variance)
         # When using PCA, features are already standardized for the PCA step; don't re-standardize for X
         standardize_for_X = False
@@ -147,6 +152,9 @@ def main():
     # Pre-build file paths
     lake_plot_kmeans = lake_plots_dir / f"{base}_kmeans_scan.png"
     lake_plot_ward = lake_plots_dir / f"{base}_ward_scan.png"
+
+    local_plot_kmeans = local_plots_dir / f"{base}_kmeans_scan.png"
+    local_plot_ward = local_plots_dir / f"{base}_ward_scan.png"
 
     lake_parquet_kmeans = lake_frames_dir / f"{base}_kmeans.parquet"
     lake_parquet_ward = lake_frames_dir / f"{base}_ward.parquet"
@@ -195,8 +203,8 @@ def main():
         logging.info("Saved clustered frame → lake=%s | local=%s", lake_parquet_kmeans, local_parquet_kmeans)
 
         # Plots → lake + local (helper saves both)
-        plot_k_scan_to_fs(res_km, str(lake_plot_kmeans), str(lake_plot_kmeans).replace(str(lake_plots_dir), str(lake_plots_dir)))
-        logging.info("Saved KMeans scan plot → %s", lake_plot_kmeans)
+        plot_k_scan_to_fs(res_km, str(lake_plot_kmeans), str(local_plot_kmeans))
+        logging.info("Saved KMeans scan plot to lake_dir=%s | local_dir=%s", lake_plots_dir, local_plots_dir)
 
     # ---------------
     # Ward pipeline
@@ -227,8 +235,81 @@ def main():
         logging.info("Saved clustered frame → lake=%s | local=%s", lake_parquet_ward, local_parquet_ward)
 
         # Plots → lake + local
-        plot_ward_scan_to_fs(res_w, str(lake_plot_ward), str(lake_plot_ward).replace(str(lake_plots_dir), str(lake_plots_dir)))
-        logging.info("Saved Ward scan plot → %s", lake_plot_ward)
+        plot_ward_scan_to_fs(res_w, str(lake_plot_ward), str(local_plot_ward))
+        logging.info("Saved Ward scan plot to lake_dir=%s | local_dir=%s", lake_plots_dir, local_plots_dir)
+
+        # Dendrogram plot
+        plot_dendrogram_to_fs(
+            X=X,
+            threshold=t_final,
+            lake_path=str(lake_plot_ward).replace(".png", "_dendrogram.png"),
+            local_path=str(local_plot_ward).replace(".png", "_dendrogram.png"),
+            show_contracted=True,
+            leaf_font_size=10,
+        )
+        logging.info("Saved Ward dendrogram plot to lake_dir=%s | local_dir=%s", lake_plots_dir, local_plots_dir)
+
+    # ---------------
+    # Summary
+    # ---------------
+    if args.algo == "both":
+        logging.info("Generating comparison summary and plots...")
+
+        summary = [
+            {
+                "Ticker": paths.output_prefix,
+                "Method": "KMeans",
+                "Best Parameter": f"k = {k_final}",
+                "Number of Clusters": out_km.select(pl.col("cluster").n_unique()).item(),
+                "Silhouette Score": res_km.silhouette[0],
+                "Calinski-Harabasz Score": res_km.calinski_harabasz[0],
+                "Davies-Bouldin Score": res_km.davies_bouldin[0],
+                "Wasserstein distance": res_km.wasserstein[0],
+                "Stability (ARI)": info["best"]["score"]
+            },
+            {
+                "Ticker": paths.output_prefix,
+                "Method": "Ward Linkage",
+                "Best Parameter": f"threshold = {t_final:.2f}",
+                "Number of Clusters": out_w.select(pl.col("cluster").n_unique()).item(),
+                "Silhouette Score": res_w.silhouette[0],
+                "Calinski-Harabasz Score": res_w.calinski_harabasz[0],
+                "Davies-Bouldin Score": res_w.davies_bouldin[0],
+                "Wasserstein distance": res_w.wasserstein[0],
+                "Stability (ARI)": info_w["best"]["score"]
+            }
+        ]
+        summary_df = pd.DataFrame(summary) 
+        
+        raw_metrics = {
+            f"{paths.output_prefix}_KMeans": [
+                res_km.silhouette[0],
+                res_km.calinski_harabasz[0],
+                1 / res_km.davies_bouldin[0],
+                1 / res_km.wasserstein[0]
+            ],
+            f"{paths.output_prefix}_Ward": [
+                res_w.silhouette[0],
+                res_w.calinski_harabasz[0],
+                1 / res_w.davies_bouldin[0],
+                1 / res_w.wasserstein[0]
+            ]
+        }
+
+        export_comparison_summary_and_plots(
+            summary_df=summary_df,
+            raw_metrics=raw_metrics,
+            clustered_frames = {
+                f"{paths.output_prefix}_KMeans": out_km,
+                f"{paths.output_prefix}_Ward": out_w
+            },
+            lake_frame_path=str(lake_frames_dir / f"{paths.output_prefix}_{suffix}_summary.csv"),
+            local_frame_path=str(local_frames_dir / f"{paths.output_prefix}_{suffix}_summary.csv"),
+            lake_plot_path=str(lake_plots_dir / f"{paths.output_prefix}_{suffix}_comparison.png"),
+            local_plot_path=str(local_plots_dir / f"{paths.output_prefix}_{suffix}_comparison.png"),
+        )
+        
+        logging.info("Saved comparison summary and plots.")
 
     logging.info("DONE.")
 

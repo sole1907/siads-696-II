@@ -13,3 +13,5 @@ spy_features_parquet/
 *.parquet
 venv
 *.png
+parquet/
+artifacts/
