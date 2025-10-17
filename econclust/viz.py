@@ -105,23 +105,16 @@ def plot_dendrogram_to_fs(
     write_bytes_fs(lake_path, data)
     lake_to_local(lake_path, local_path)
 
-def export_comparison_summary_and_plots(
-    summary_df: pd.DataFrame,
+def export_comparison_plots(
     raw_metrics: dict,
     clustered_frames: dict,
-    lake_frame_path: str,
-    local_frame_path: str,
     lake_plot_path: str,
     local_plot_path: str,
 ) -> None:
     """
-    Save summary dataframe as CSV and generate comparison plots (bar + radar) to lake and local paths.
+    Generate comparison plots (bar + radar) to lake and local paths.
     Works dynamically for any ticker prefix (e.g., SPY, QQQ, etc.).
     """
-    # --- Save summary as CSV ---
-    csv_bytes = summary_df.to_csv(index=False).encode("utf-8")
-    write_bytes_fs(lake_frame_path, csv_bytes)
-    lake_to_local(lake_frame_path, local_frame_path)
 
     # --- Cluster Size Bar Chart ---
     def convert_sizes(pl_df):
