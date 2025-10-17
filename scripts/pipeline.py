@@ -123,7 +123,7 @@ def main():
     logging.info("Reading: %s", in_path.resolve())
 
     # Load
-    df = pl.read_parquet(str(in_path))
+    df = pl.read_parquet(str(in_path)).head(7000)
     logging.info("Input shape: rows=%d, cols=%d", df.height, len(df.columns))
 
     # Columns check
