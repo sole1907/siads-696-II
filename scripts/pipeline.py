@@ -88,6 +88,7 @@ def main():
     ap.add_argument("--thresholds", type=str, default="30,40,50,60,70,80,90,100", help="Ward thresholds CSV")
     ap.add_argument("--run-name", type=str, default=None, help="Optional run name (subfolder for outputs)")
     ap.add_argument("--log-level", type=str, default="INFO", help="DEBUG|INFO|WARNING|ERROR")
+    ap.add_argument("--sample-size", type=int, default=None, help="Optional sample size for training")
     args = ap.parse_args()
 
     setup_logging(args.log_level)
@@ -124,6 +125,21 @@ def main():
 
     # Load
     df = pl.read_parquet(str(in_path))
+
+    # Optional sampling
+    if args.sample_size is not None and args.sample_size < df.height:
+        logging.info("Sampling %d records from full dataset with year-wise stratification...", args.sample_size)
+
+        # Ensure 'year' column exists and is properly typed
+        if "year" not in df.columns:
+            raise ValueError("Stratified sampling requires a 'year' column in the dataset.")
+    
+        df = (
+            df.with_columns(pl.col("year").cast(pl.Int32))
+            .group_by("year", maintain_order=True)
+            .map_groups(lambda group: group.sample(n=max(1, int(args.sample_size / 19)), seed=42))
+        )
+
     logging.info("Input shape: rows=%d, cols=%d", df.height, len(df.columns))
 
     # Columns check
