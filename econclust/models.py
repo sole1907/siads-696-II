@@ -2,7 +2,8 @@ from __future__ import annotations
 from typing import Optional
 import numpy as np, polars as pl
 from sklearn.cluster import KMeans
-from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.cluster.hierarchy import fcluster
+from fastcluster import linkage
 
 def cluster_from_X(
     X: np.ndarray,
