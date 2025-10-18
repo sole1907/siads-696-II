@@ -10,7 +10,7 @@
 #   python dashboard.py
 #   open http://127.0.0.1:5000
 #
-# Configure POSTGRES_URI / SCHEMA / TABLE_NAME via env vars or edit below.
+# Configure POSTGRES_URI / SCHEMA / TABLE_NAME via a .env file or OS env vars.
 
 from __future__ import annotations
 
@@ -22,31 +22,30 @@ import numpy as np
 import pandas as pd
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
+import dotenv
 
-# -----------------------------------------------------------------------------
-# Configuration (edit or use env vars)
-# -----------------------------------------------------------------------------
+# Load .env if present
+dotenv.load_dotenv()  
+
+
 POSTGRES_URI = os.getenv(
     "POSTGRES_URI",
-    "postgresql+psycopg2://iv_cluster_user:4Z8mkXlMjoXUDEXwN1JIA7pbNh2rYyLh@"
-    "dpg-d3plbtl6ubrc73f98j7g-a.oregon-postgres.render.com/iv_cluster"
+    # Fallback only for local dev; prefer setting POSTGRES_URI in .env
+    "postgresql+psycopg2://user:password@host:5432/dbname"
 )
-SCHEMA = os.getenv("SCHEMA", None)  # e.g. "public" or None to rely on search_path
+
+SCHEMA = os.getenv("SCHEMA", None)               
 TABLE_NAME = os.getenv("TABLE_NAME", "sampled_regimes")
 LABEL_COL  = os.getenv("LABEL_COL", "cluster")
 
 # Maximum rows the API will serve at once (safety cap)
 API_ROWS_CAP = int(os.getenv("API_ROWS_CAP", "50000"))
 
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
+
 
 def _append_conn_params(uri: str) -> str:
-    # keepalives improve stability behind proxies; sslmode is required on Render
-    params = "sslmode=require&keepalives=1&keepalives_idle=30&keepalives_interval=10&keepalives_count=5"
+    # keepalives improve stability behind proxies; sslmode is required on many hosted PGs
     sep = "&" if "?" in uri else "?"
-    # Avoid duplicates
     if "sslmode=" not in uri:
         uri += sep + "sslmode=require"
         sep = "&"
@@ -108,9 +107,7 @@ def df_to_js_records(pdf: pd.DataFrame) -> Tuple[List[Dict[str, Any]], List[str]
         rows.append(rec)
     return rows, dt_cols
 
-# -----------------------------------------------------------------------------
-# Flask app
-# -----------------------------------------------------------------------------
+
 
 app = Flask(__name__)
 
@@ -426,4 +423,6 @@ def api_data() -> Response:
     })
 
 if __name__ == "__main__":
+    # Optional: explicitly point to a non-default .env path:
+    # dotenv.load_dotenv(".env")  # already loaded above; uncomment to force reload
     app.run(host="127.0.0.1", port=5000, debug=True)

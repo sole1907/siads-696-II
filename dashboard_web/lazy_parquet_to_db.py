@@ -6,9 +6,9 @@ Lazy-sample a Parquet file and upload to PostgreSQL.
 
 Example (Render Postgres):
 python ./dashboard_web/lazy_parquet_to_db.py \
-  --parquet ./data/SPY_raw_kmeans.parquet \
-  --postgres-uri "postgresql+psycopg2://iv_cluster_user:4Z8mkXlMjoXUDEXwN1JIA7pbNh2rYyLh@dpg-d3plbtl6ubrc73f98j7g-a.oregon-postgres.render.com/iv_cluster" \
-  --table sampled_regimes \
+  --parquet ./data/path.parquet \
+  --postgres-uri "postgresql+psycopg2://user:host@domain/db" \
+  --table tablename \
   --fraction 0.05 \
   --if-exists replace \
   --create-index "date,cluster"
