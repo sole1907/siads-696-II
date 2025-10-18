@@ -6,9 +6,13 @@ from joblib import Parallel, delayed
 from threadpoolctl import threadpool_limits
 from sklearn.cluster import KMeans, MiniBatchKMeans
 from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score, adjusted_rand_score
-from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.cluster.hierarchy import fcluster
+from fastcluster import linkage
 from scipy.stats import wasserstein_distance
 from .features import _prep_features
+from itertools import product
+from multiprocessing import Manager
+import time
 
 # ---------- Common helpers ----------
 def _kneedle(x: np.ndarray, y: np.ndarray) -> int:
@@ -57,7 +61,7 @@ def scan_kmeans(
     n_jobs: int = 8,
     silhouette_sample_size: Optional[int] = 5000,
     use_minibatch: bool = True,
-    mbk_max_iter: int = 100,
+    mbk_max_iter: int = 200,
 ) -> KScanResult:
     if X is None:
         assert df is not None and feature_cols is not None
@@ -66,27 +70,33 @@ def scan_kmeans(
     KM = MiniBatchKMeans if use_minibatch else KMeans
     km_kwargs = dict(n_clusters=None, random_state=random_state, n_init=n_init)
     if use_minibatch:
-        km_kwargs.update(dict(batch_size=4096, max_iter=mbk_max_iter, reassignment_ratio=0.01))
+        km_kwargs.update(dict(batch_size=10000, max_iter=mbk_max_iter, reassignment_ratio=0.01))
     else:
         km_kwargs["algorithm"] = "elkan"
 
     def _one(k: int):
-        with threadpool_limits(limits=1):
-            km = KM(**{**km_kwargs, "n_clusters": k})
-            labels = km.fit_predict(X)
-            inertia = float(km.inertia_)
-            if k >= 2 and len(set(labels)) > 1:
-                sil = float(silhouette_score(X, labels,
-                        sample_size=min(silhouette_sample_size, len(X)) if silhouette_sample_size else None,
-                        random_state=random_state))
-                ch  = float(calinski_harabasz_score(X, labels))
-                db  = float(davies_bouldin_score(X, labels))
-                w1  = _kmeans_wasserstein(X, labels)
-            else:
-                sil = ch = db = w1 = None
-            return k, inertia, sil, ch, db, w1
+        start = time.time()
+        print(f"[KMeans] Fitting k={k}...")
+        
+        # with threadpool_limits(limits=1):
+        km = KM(**{**km_kwargs, "n_clusters": k})
+        labels = km.fit_predict(X)
+        inertia = float(km.inertia_)
+        if k >= 2 and len(set(labels)) > 1:
+            sil = float(silhouette_score(X, labels,
+                    sample_size=min(silhouette_sample_size, len(X)) if silhouette_sample_size else None,
+                    random_state=random_state))
+            ch  = float(calinski_harabasz_score(X, labels))
+            db  = float(davies_bouldin_score(X, labels))
+            w1  = _kmeans_wasserstein(X, labels)
+        else:
+            sil = ch = db = w1 = None
 
-    results = Parallel(n_jobs=n_jobs, prefer="threads", require="sharedmem")(delayed(_one)(k) for k in ks)
+        elapsed = time.time() - start
+        print(f"[KMeans] k={k} completed in {elapsed:.2f}s")
+        return k, inertia, sil, ch, db, w1
+
+    results = Parallel(n_jobs=n_jobs, prefer="processes")(delayed(_one)(k) for k in ks)
     results.sort(key=lambda t: t[0])
     inertia = [r[1] for r in results]; silh = [r[2] for r in results]
     chs = [r[3] for r in results]; dbs = [r[4] for r in results]; w1s = [r[5] for r in results]
@@ -154,8 +164,14 @@ def scan_ward(
     th = list(map(float, thresholds))
     silh, chs, dbs, w1s = [], [], [], []
     for t in th:
+        start = time.time()
+        print(f"[Ward] Evaluating threshold={t:.2f}...")
+        
         s, c, d, w = metrics(t)
         silh.append(s); chs.append(c); dbs.append(d); w1s.append(w)
+
+        elapsed = time.time() - start
+        print(f"[Ward] Threshold={t:.2f} completed in {elapsed:.2f}s")
 
     def best_idx_high(arr): 
         a = np.array([(-np.inf if v is None else v) for v in arr], dtype=float); 
@@ -195,31 +211,53 @@ def _normalize_metrics(silh, dbs):
 def optimize_w_weights_by_stability_fast(
     ks: List[int], res: KScanResult, *, X: np.ndarray, alphas=(0.25,0.5,1.0,2.0,4.0),
     betas=(0.25,0.5,1.0,2.0,4.0), random_state: int = 42, n_init: int | str = "auto",
-    bootstraps: int = 6, sample_frac: float = 0.8, n_jobs_stability: int = 8,
+    bootstraps: int = 3, sample_frac: float = 0.4, n_jobs_stability: int = 8, use_minibatch: bool = True, mbk_max_iter: int = 200,
 ) -> Tuple[float, float, int, Dict]:
     s_n, d_n, valid = _normalize_metrics(res.silhouette, res.davies_bouldin)
     ks_arr = np.array(ks); ks_valid = ks_arr[np.where(valid)[0]]
     if ks_valid.size == 0:
         raise ValueError("No valid (silhouette, DB) pairs to optimize over.")
     rng = np.random.RandomState(random_state)
+    n = X.shape[0]
+    m = max(2, int(round(sample_frac * n)))
 
-    def stability_for_k(k: int) -> float:
-        with threadpool_limits(limits=1):
-            km0 = KMeans(n_clusters=k, random_state=random_state, n_init=n_init, algorithm="elkan")
-            km0.fit(X)
-            n = X.shape[0]; m = max(2, int(round(sample_frac * n)))
-            aris = []
-            for b in range(bootstraps):
-                idx = rng.choice(n, size=m, replace=True); Xb = X[idx]
-                kmb = KMeans(n_clusters=k, random_state=random_state+b+1, n_init=n_init, algorithm="elkan")
-                Lb  = kmb.fit_predict(Xb); L0b = km0.predict(Xb)
-                aris.append(adjusted_rand_score(L0b, Lb))
-            return float(np.mean(aris)) if aris else np.nan
+    total = len(ks_valid) * bootstraps  
+    manager = Manager()  
+    counter = manager.Value("i", 0)  
+    
+    def compute_ari_for_k_b(k: int, b: int) -> Tuple[int, float]:
+        start = time.time()  
+        print(f"[Stability-KMeans] Computing ARI for k={k}, bootstrap={b}...") 
+        
+        KM = MiniBatchKMeans if use_minibatch else KMeans
+        km_kwargs = dict(n_clusters=None, random_state=random_state, n_init=n_init)
+        if use_minibatch:
+            km_kwargs.update(dict(batch_size=10000, max_iter=mbk_max_iter, reassignment_ratio=0.01))
+        else:
+            km_kwargs["algorithm"] = "elkan"
+        km0 = KM(**{**km_kwargs, "n_clusters": k})
+        km0.fit(X)
+        idx = rng.choice(n, size=m, replace=True); Xb = X[idx]
+        kmb = KM(**{**km_kwargs, "n_clusters": k, "random_state": random_state+b+1})
+        Lb  = kmb.fit_predict(Xb); L0b = km0.predict(Xb)
+        ari = adjusted_rand_score(L0b, Lb)
 
-    stab_vals = Parallel(n_jobs=n_jobs_stability, prefer="threads", require="sharedmem")(
-        delayed(stability_for_k)(int(k)) for k in ks_valid
+        elapsed = time.time() - start  
+        counter.value += 1
+        percent = (counter.value / total) * 100
+        print(f"[Stability-KMeans] k={k}, bootstrap={b} completed in {elapsed:.2f}s ({percent:.1f}% done)")  
+        
+        return k, ari
+
+    results = Parallel(n_jobs=n_jobs_stability, prefer="processes")(
+        delayed(compute_ari_for_k_b)(k, b) for k, b in product(ks_valid, range(bootstraps))
     )
-    stability_scores = {int(k): float(v) for k, v in zip(ks_valid, stab_vals)}
+
+    stability_scores = {}
+    for k in ks_valid:
+        aris_k = [ari for k_, ari in results if k_ == k]
+        stability_scores[k] = float(np.mean(aris_k)) if aris_k else np.nan
+
     best = {"alpha": None, "beta": None, "k": None, "score": -np.inf}
     one_minus_s = 1.0 - s_n[valid]; d_vec = np.abs(d_n[valid])
     for a in alphas:
@@ -233,7 +271,7 @@ def optimize_w_weights_by_stability_fast(
 
 def optimize_w_weights_by_stability_ward(
     thresholds: List[float], res: ScanResultWard, *, X: np.ndarray, alphas=(0.25,0.5,1.0,2.0,4.0),
-    betas=(0.25,0.5,1.0,2.0,4.0), random_state: int = 42, bootstraps: int = 6, sample_frac: float = 0.8,
+    betas=(0.25,0.5,1.0,2.0,4.0), random_state: int = 42, bootstraps: int = 3, sample_frac: float = 0.4,
     n_jobs_stability: int = 8,
 ) -> Tuple[float, float, float, Dict]:
     s_n, d_n, valid = _normalize_metrics(res.silhouette, res.davies_bouldin)
@@ -243,23 +281,41 @@ def optimize_w_weights_by_stability_ward(
     rng = np.random.RandomState(random_state)
 
     Z0 = linkage(X, method="ward")
-    # reference labels for stability comparison
-    # (we will compare on bootstrapped subsets)
-    def stability_for_thresh(t: float) -> float:
-        with threadpool_limits(limits=1):
-            L0 = fcluster(Z0, t=t, criterion="distance") - 1
-            n = X.shape[0]; m = max(2, int(round(sample_frac * n))); aris = []
-            for b in range(bootstraps):
-                idx = rng.choice(n, size=m, replace=True); Xb = X[idx]
-                L0b = L0[idx]
-                Lb  = fcluster(linkage(Xb, method="ward"), t=t, criterion="distance") - 1
-                aris.append(adjusted_rand_score(L0b, Lb))
-            return float(np.mean(aris)) if aris else np.nan
+    n = X.shape[0]
+    m = max(2, int(round(sample_frac * n))) 
+    
+    total = len(th_valid) * bootstraps  
+    manager = Manager()  
+    counter = manager.Value("i", 0)  
+    
+    def compute_ari_for_t_b(t: float, b: int) -> Tuple[float, float]:
+        start = time.time()  
+        print(f"[Stability-Ward] Computing ARI for threshold={t:.2f}, bootstrap={b}...") 
+        
+        L0 = fcluster(Z0, t=t, criterion="distance") - 1
+        idx = rng.choice(n, size=m, replace=True)
+        Xb = X[idx]
+        L0b = L0[idx]
+        Lb = fcluster(linkage(Xb, method="ward"), t=t, criterion="distance") - 1
+        ari = adjusted_rand_score(L0b, Lb)
 
-    stab_vals = Parallel(n_jobs=n_jobs_stability, prefer="threads", require="sharedmem")(
-        delayed(stability_for_thresh)(float(t)) for t in th_valid
+        elapsed = time.time() - start  
+        counter.value += 1
+        percent = (counter.value / total) * 100
+        print(f"[Stability-Ward] threshold={t:.2f}, bootstrap={b} completed in {elapsed:.2f}s ({percent:.1f}% done)")
+        
+        return t, ari
+
+    results = Parallel(n_jobs=n_jobs_stability, prefer="processes")(
+        delayed(compute_ari_for_t_b)(t, b) for t, b in product(th_valid, range(bootstraps))
     )
-    stability_scores = {float(t): float(v) for t, v in zip(th_valid, stab_vals)}
+
+    stability_scores = {}
+    for t in th_valid:
+        aris_t = [ari for t_, ari in results if t_ == t]
+        stability_scores[t] = float(np.mean(aris_t)) if aris_t else np.nan
+
+
     best = {"alpha": None, "beta": None, "threshold": None, "score": -np.inf}
     one_minus_s = 1.0 - s_n[valid]; d_vec = np.abs(d_n[valid])
     for a in alphas:

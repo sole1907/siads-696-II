@@ -28,6 +28,6 @@ params:
   n_jobs: 8
   silhouette_sample_size: 5000
   minibatch_iter: 100
-  stability_bootstraps: 6
-  stability_sample_frac: 0.8
+  stability_bootstraps: 3
+  stability_sample_frac: 0.3
   final_kmeans_n_init: 20
