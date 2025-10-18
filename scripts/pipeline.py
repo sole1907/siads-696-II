@@ -23,9 +23,10 @@ from econclust import (
     cluster_from_X,
     write_parquet_fs,
     lake_to_local,
+    write_bytes_fs
     downsample_dataframe,
 )
-from econclust.viz import plot_k_scan_to_fs, plot_ward_scan_to_fs, plot_dendrogram_to_fs, export_comparison_summary_and_plots
+from econclust.viz import plot_k_scan_to_fs, plot_ward_scan_to_fs, plot_dendrogram_to_fs, export_comparison_plots
 
 # --------------------
 # Logging & path utils
@@ -74,7 +75,7 @@ def main():
     ap = argparse.ArgumentParser(description="Unified clustering pipeline")
     ap.add_argument("--config", type=str, default="configs/default.yml")
     ap.add_argument("--algo", choices=["kmeans", "ward", "both"], default="both")
-    ap.add_argument("--input", type=str, default=None, help="Input parquet file")
+    ap.add_argument("--input", type=str, nargs='+', default=None, help="One or more input parquet files")
     ap.add_argument("--downsample", type=int, default=None, help="Downsample percentage (1-100)")
     ap.add_argument("--features", nargs='+', default=None, help="Feature columns")
     ap.add_argument("--pca", type=float, default=None, help="PCA variance (e.g. 0.95)")
@@ -90,6 +91,7 @@ def main():
     ap.add_argument("--thresholds", type=str, default="30,40,50,60,70,80,90,100", help="Ward thresholds CSV")
     ap.add_argument("--run-name", type=str, default=None, help="Optional run name (subfolder for outputs)")
     ap.add_argument("--log-level", type=str, default="INFO", help="DEBUG|INFO|WARNING|ERROR")
+    ap.add_argument("--sample-size", type=int, default=None, help="Optional sample size for training")
     args = ap.parse_args()
 
     setup_logging(args.log_level)
@@ -98,7 +100,9 @@ def main():
     paths, P = cfg.paths, cfg.params
 
     # Override config with CLI args if provided
-    input_parquet = args.input if args.input else paths.input_parquet
+    input_parquets = args.input if args.input else (
+        paths.input_parquet if isinstance(paths.input_parquet, list) else [paths.input_parquet]
+    )
     features = args.features if args.features else P.features
     downsample_pct = args.downsample if args.downsample is not None else 100
     pca_variance = args.pca if args.pca is not None else P.pca_variance
@@ -119,14 +123,40 @@ def main():
     logging.info("Config loaded: %s", args.config)
     logging.info("Algo: %s | use_pca: %s | thresholds: %s", args.algo, args.use_pca, args.thresholds)
 
-    # Input existence check
-    in_path = Path(input_parquet)
-    if not in_path.exists():
-        raise FileNotFoundError(f"Input parquet not found: {in_path.resolve()}")
-    logging.info("Reading: %s", in_path.resolve())
-
     # Load
-    df = pl.read_parquet(str(in_path))
+    # Validate and load each file
+    dfs = []
+    for path_str in input_parquets:
+        path = Path(path_str)
+        if not path.exists():
+            raise FileNotFoundError(f"Input parquet not found: {path.resolve()}")
+        logging.info("Reading: %s", path.resolve())
+        dfs.append(pl.read_parquet(str(path)))
+
+    # Merge all into one DataFrame
+    df = pl.concat(dfs, how="vertical")
+    # df = pl.read_parquet(str(in_path))
+
+    # Optional sampling
+    if args.sample_size is not None and args.sample_size < df.height:
+        logging.info("Sampling %d records from full dataset with proportional stratification on year and secid...", args.sample_size)
+    
+        for col in ["year", "secid"]:
+            if col not in df.columns:
+                raise ValueError(f"Stratified sampling requires '{col}' column in the dataset.")
+    
+        df = df.with_columns([
+            pl.col("year").cast(pl.Int32),
+            (pl.col("year").cast(pl.Utf8) + "_" + pl.col("secid").cast(pl.Utf8)).alias("year_secid")
+        ])
+    
+        total_rows = df.height
+    
+        df = (
+            df.group_by("year_secid", maintain_order=True)
+            .map_groups(lambda group: group.sample(n=int(args.sample_size * group.height / total_rows), seed=42))
+        )
+
     logging.info("Input shape: rows=%d, cols=%d", df.height, len(df.columns))
     
     # Downsample if requested
@@ -171,6 +201,8 @@ def main():
     local_parquet_kmeans = local_frames_dir / f"{base}_kmeans.parquet"
     local_parquet_ward = local_frames_dir / f"{base}_ward.parquet"
 
+    summary = []
+    
     # ----------------
     # KMeans pipeline
     # ----------------
@@ -206,10 +238,36 @@ def main():
         # Final fit
         out_km = cluster_from_X(X, df, method="kmeans", n_clusters=k_final, n_init=P.final_kmeans_n_init)
 
+        # one hot encode cluster column
+        out_km_encoded = out_km.to_dummies(columns=["cluster"])
+
         # Save to lake, copy to local
         write_parquet_fs(out_km, str(lake_parquet_kmeans))
         lake_to_local(str(lake_parquet_kmeans), str(local_parquet_kmeans))
         logging.info("Saved clustered frame → lake=%s | local=%s", lake_parquet_kmeans, local_parquet_kmeans)
+
+        # Build encoded file paths
+        lake_parquet_kmeans_encoded = str(lake_parquet_kmeans).replace(".parquet", "_encoded.parquet")
+        local_parquet_kmeans_encoded = str(local_parquet_kmeans).replace(".parquet", "_encoded.parquet")
+        
+        # Save encoded frame
+        write_parquet_fs(out_km_encoded, lake_parquet_kmeans_encoded)
+        lake_to_local(lake_parquet_kmeans_encoded, local_parquet_kmeans_encoded)
+        logging.info("Saved encoded clustered frame → lake=%s | local=%s", lake_parquet_kmeans_encoded, local_parquet_kmeans_encoded)
+
+        summary.append(
+            {
+                "Ticker": paths.output_prefix,
+                "Method": "KMeans",
+                "Best Parameter": f"k = {k_final}",
+                "Number of Clusters": out_km.select(pl.col("cluster").n_unique()).item(),
+                "Silhouette Score": res_km.silhouette[0],
+                "Calinski-Harabasz Score": res_km.calinski_harabasz[0],
+                "Davies-Bouldin Score": res_km.davies_bouldin[0],
+                "Wasserstein distance": res_km.wasserstein[0],
+                "Stability (ARI)": info["best"]["score"]
+            }
+        )
 
         # Plots → lake + local (helper saves both)
         plot_k_scan_to_fs(res_km, str(lake_plot_kmeans), str(local_plot_kmeans))
@@ -238,15 +296,41 @@ def main():
 
         out_w = cluster_from_X(X, df, method="ward", ward_threshold=t_final)
 
+        # one hot encode cluster column
+        out_w_encoded = out_w.to_dummies(columns=["cluster"])
+
         # Save to lake, copy to local
         write_parquet_fs(out_w, str(lake_parquet_ward))
         lake_to_local(str(lake_parquet_ward), str(local_parquet_ward))
         logging.info("Saved clustered frame → lake=%s | local=%s", lake_parquet_ward, local_parquet_ward)
 
+        # Build encoded file paths
+        lake_parquet_ward_encoded = str(lake_parquet_ward).replace(".parquet", "_encoded.parquet")
+        local_parquet_ward_encoded = str(local_parquet_ward).replace(".parquet", "_encoded.parquet")
+        
+        # Save encoded frame
+        write_parquet_fs(out_w_encoded, lake_parquet_ward_encoded)
+        lake_to_local(lake_parquet_ward_encoded, local_parquet_ward_encoded)
+        logging.info("Saved encoded clustered frame → lake=%s | local=%s", lake_parquet_ward_encoded, local_parquet_ward_encoded)
+
         # Plots → lake + local
         plot_ward_scan_to_fs(res_w, str(lake_plot_ward), str(local_plot_ward))
         logging.info("Saved Ward scan plot to lake_dir=%s | local_dir=%s", lake_plots_dir, local_plots_dir)
 
+        summary.append(
+            {
+                "Ticker": paths.output_prefix,
+                "Method": "Ward Linkage",
+                "Best Parameter": f"threshold = {t_final:.2f}",
+                "Number of Clusters": out_w.select(pl.col("cluster").n_unique()).item(),
+                "Silhouette Score": res_w.silhouette[0],
+                "Calinski-Harabasz Score": res_w.calinski_harabasz[0],
+                "Davies-Bouldin Score": res_w.davies_bouldin[0],
+                "Wasserstein distance": res_w.wasserstein[0],
+                "Stability (ARI)": info_w["best"]["score"]
+            }
+        )
+        
         # Dendrogram plot
         plot_dendrogram_to_fs(
             X=X,
@@ -261,35 +345,19 @@ def main():
     # ---------------
     # Summary
     # ---------------
-    if args.algo == "both":
-        logging.info("Generating comparison summary and plots...")
+    # --- Save summary as CSV ---
+    logging.info("Generating comparison summary and plots...")
 
-        summary = [
-            {
-                "Ticker": paths.output_prefix,
-                "Method": "KMeans",
-                "Best Parameter": f"k = {k_final}",
-                "Number of Clusters": out_km.select(pl.col("cluster").n_unique()).item(),
-                "Silhouette Score": res_km.silhouette[0],
-                "Calinski-Harabasz Score": res_km.calinski_harabasz[0],
-                "Davies-Bouldin Score": res_km.davies_bouldin[0],
-                "Wasserstein distance": res_km.wasserstein[0],
-                "Stability (ARI)": info["best"]["score"]
-            },
-            {
-                "Ticker": paths.output_prefix,
-                "Method": "Ward Linkage",
-                "Best Parameter": f"threshold = {t_final:.2f}",
-                "Number of Clusters": out_w.select(pl.col("cluster").n_unique()).item(),
-                "Silhouette Score": res_w.silhouette[0],
-                "Calinski-Harabasz Score": res_w.calinski_harabasz[0],
-                "Davies-Bouldin Score": res_w.davies_bouldin[0],
-                "Wasserstein distance": res_w.wasserstein[0],
-                "Stability (ARI)": info_w["best"]["score"]
-            }
-        ]
-        summary_df = pd.DataFrame(summary) 
-        
+    lake_frame_path=str(lake_frames_dir / f"{paths.output_prefix}_{suffix}_summary.csv")
+    local_frame_path=str(local_frames_dir / f"{paths.output_prefix}_{suffix}_summary.csv")
+    summary_df = pd.DataFrame(summary) 
+    csv_bytes = summary_df.to_csv(index=False).encode("utf-8")
+    write_bytes_fs(lake_frame_path, csv_bytes)
+    lake_to_local(lake_frame_path, local_frame_path)
+
+    logging.info("Saved comparison summary.")
+    
+    if args.algo == "both":
         raw_metrics = {
             f"{paths.output_prefix}_KMeans": [
                 res_km.silhouette[0],
@@ -305,20 +373,17 @@ def main():
             ]
         }
 
-        export_comparison_summary_and_plots(
-            summary_df=summary_df,
+        export_comparison_plots(
             raw_metrics=raw_metrics,
             clustered_frames = {
                 f"{paths.output_prefix}_KMeans": out_km,
                 f"{paths.output_prefix}_Ward": out_w
             },
-            lake_frame_path=str(lake_frames_dir / f"{paths.output_prefix}_{suffix}_summary.csv"),
-            local_frame_path=str(local_frames_dir / f"{paths.output_prefix}_{suffix}_summary.csv"),
             lake_plot_path=str(lake_plots_dir / f"{paths.output_prefix}_{suffix}_comparison.png"),
             local_plot_path=str(local_plots_dir / f"{paths.output_prefix}_{suffix}_comparison.png"),
         )
         
-        logging.info("Saved comparison summary and plots.")
+        logging.info("Saved comparison plots.")
 
     logging.info("DONE.")
 
