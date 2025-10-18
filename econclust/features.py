@@ -4,6 +4,28 @@ import math, numpy as np, polars as pl
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
+import polars as pl
+from typing import Union
+import holidays
+
+def temporal_feature_engineering(df: pl.DataFrame, date_col: str) -> pl.DataFrame:
+    """
+    Add temporal features to a Polars DataFrame or LazyFrame.
+    """
+    df = df.with_columns(
+        pl.col(date_col).dt.month().alias(f"{date_col}_month"),
+        pl.col(date_col).dt.day().alias(f"{date_col}_day"),
+        pl.col(date_col).dt.quarter().alias(f"{date_col}_quarter"),
+        pl.col(date_col).dt.weekday().alias(f"{date_col}_weekday"),
+    )
+    
+    us_holidays = holidays.US(years=df[date_col].dt.year().unique().to_list())
+    df = df.with_columns([
+        pl.col(date_col).is_in(list(us_holidays)).alias(f"{date_col}_is_holiday"),
+        (pl.col(date_col) - pl.duration(days=1)).is_in(list(us_holidays)).alias(f"{date_col}_is_holiday_eve"),
+    ])
+    return df
+
 def _prep_features(df: pl.DataFrame, feature_cols: List[str], standardize: bool = True,
                    dtype: np.dtype = np.float32) -> np.ndarray:
     X = (df.select([pl.col(c).cast(pl.Float32).fill_null(0.0) for c in feature_cols])
