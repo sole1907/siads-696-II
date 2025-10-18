@@ -24,6 +24,7 @@ from econclust import (
     write_parquet_fs,
     lake_to_local,
     write_bytes_fs
+    downsample_dataframe,
 )
 from econclust.viz import plot_k_scan_to_fs, plot_ward_scan_to_fs, plot_dendrogram_to_fs, export_comparison_plots
 
@@ -75,6 +76,7 @@ def main():
     ap.add_argument("--config", type=str, default="configs/default.yml")
     ap.add_argument("--algo", choices=["kmeans", "ward", "both"], default="both")
     ap.add_argument("--input", type=str, nargs='+', default=None, help="One or more input parquet files")
+    ap.add_argument("--downsample", type=int, default=None, help="Downsample percentage (1-100)")
     ap.add_argument("--features", nargs='+', default=None, help="Feature columns")
     ap.add_argument("--pca", type=float, default=None, help="PCA variance (e.g. 0.95)")
     ap.add_argument("--standardize", type=str, default=None, help="Standardize features (true/false)")
@@ -102,6 +104,7 @@ def main():
         paths.input_parquet if isinstance(paths.input_parquet, list) else [paths.input_parquet]
     )
     features = args.features if args.features else P.features
+    downsample_pct = args.downsample if args.downsample is not None else 100
     pca_variance = args.pca if args.pca is not None else P.pca_variance
     standardize = args.standardize.lower() == "true" if args.standardize is not None else True
     lake_root = args.lake_root if args.lake_root else paths.lake_root
@@ -155,6 +158,12 @@ def main():
         )
 
     logging.info("Input shape: rows=%d, cols=%d", df.height, len(df.columns))
+    
+    # Downsample if requested
+    if downsample_pct < 100:
+        logging.info("Downsampling data to %d%% of rows...", downsample_pct)
+        df = downsample_dataframe(df, target_size=downsample_pct)
+        logging.info("Downsampled shape: rows=%d, cols=%d", df.height, len(df.columns))
 
     # Columns check
     feat_cols = list(features)
