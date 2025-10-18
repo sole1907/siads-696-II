@@ -53,3 +53,37 @@ def auto_k_range(df: pl.DataFrame, feature_cols: List[str], max_cap: int = 20) -
     upper = max(upper, 4)
     print(f"Auto-selected k_range = range(2, {upper}) (samples={n_samples:,}, features={n_features})")
     return range(2, upper)
+
+def downsample_dataframe(
+    df: pl.DataFrame,
+    target_size: int,
+    random_state: int = 42
+) -> pl.DataFrame:
+    """
+    Downsample a Polars DataFrame to a target percentage of rows using daily stratification.
+
+    Args:
+        df: Polars DataFrame with a 'date' column (Date or Datetime).
+        target_size: Percentage of rows to keep within each day (1-100).
+        random_state: RNG seed for reproducibility.
+
+    Returns:
+        A downsampled DataFrame with the same columns, sampled within each 'date' group.
+    """
+    if not (1 <= target_size <= 100):
+        raise ValueError("target_size must be between 1 and 100")
+    if "date" not in df.columns:
+        raise ValueError("DataFrame must contain a 'date' column for stratification.")
+
+    fraction = target_size / 100.0
+
+    def _sample_group(g: pl.DataFrame) -> pl.DataFrame:
+        n_rows = g.height
+        n_sample = max(1, int(n_rows * fraction))
+        return g.sample(n=n_sample, with_replacement=False, shuffle=True, seed=random_state)
+
+    # Polars 1.x: use `group_by`, not `groupby`
+    downsampled = df.group_by("date").map_groups(_sample_group)
+
+    print(f"Downsampled DataFrame from {df.height:,} to {downsampled.height:,} rows.")
+    return downsampled
