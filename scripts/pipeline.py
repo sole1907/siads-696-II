@@ -23,7 +23,7 @@ from econclust import (
     cluster_from_X,
     write_parquet_fs,
     lake_to_local,
-    write_bytes_fs
+    write_bytes_fs,
     downsample_dataframe,
 )
 from econclust.viz import plot_k_scan_to_fs, plot_ward_scan_to_fs, plot_dendrogram_to_fs, export_comparison_plots

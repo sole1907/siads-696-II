@@ -26,9 +26,8 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
 
-# ---------------------------
 # Lazy Parquet sampler (Polars)
-# ---------------------------
+
 
 def lazy_sample_parquet(
     path: str,
@@ -86,9 +85,9 @@ def lazy_sample_parquet(
     return df.sample(n=take_n, with_replacement=False, seed=seed)
 
 
-# ---------------------------
+
 # Postgres upload helpers
-# ---------------------------
+
 
 import pandas as pd
 import numpy as np
@@ -96,9 +95,6 @@ import sqlalchemy as sa
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError
-
-from sqlalchemy import create_engine
-from sqlalchemy.engine import Engine
 
 def make_engine_from_args(
     *,
