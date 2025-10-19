@@ -1,0 +1,33 @@
+paths:
+  lake_root: "./artifacts/lake"
+  local_root: "./artifacts/local"
+  input_parquet: "./parquet/qqq_2005_processed.parquet"
+  output_prefix: "QQQ"
+
+params:
+  features:
+    - impl_volatility
+    - delta
+    - theta
+    - vega
+    - moneyness
+    - volume
+    - open_interest
+    - vol
+    - volume_ma5
+    - prc
+    - price_diff_1d
+    - price_diff_2d
+    - price_diff_3d
+    - price_diff_5d
+    - price_diff_8d
+    - price_diff_34d
+  date_col: date
+  pca_variance: 0.95
+  scan_max_cap: 20
+  n_jobs: 8
+  silhouette_sample_size: 5000
+  minibatch_iter: 100
+  stability_bootstraps: 3
+  stability_sample_frac: 0.3
+  final_kmeans_n_init: 20

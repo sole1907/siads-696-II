@@ -6,8 +6,15 @@ spy/
 qqq/
 __pycache__/
 .ipynb_checkpoints/
+*.pem
+*.db
 models/
 tbills/
 qqq_features_parquet/
 spy_features_parquet/
 *.parquet
+venv
+*.png
+parquet/
+artifacts/
+.env
