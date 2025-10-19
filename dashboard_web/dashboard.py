@@ -1,16 +1,4 @@
-# dashboard.py
-# -----------------------------------------------------------------------------
-# Flask app that:
-# 1) Connects to an existing PostgreSQL database
-# 2) Serves API endpoints to read rows from a target table (limit/offset)
-# 3) Provides a minimal web page to hit the API and render charts (Plotly)
-#
-# Run:
-#   pip install -r requirements.txt
-#   python dashboard.py
-#   open http://127.0.0.1:5000
-#
-# Configure POSTGRES_URI / SCHEMA / TABLE_NAME via a .env file or OS env vars.
+
 
 from __future__ import annotations
 
@@ -25,8 +13,7 @@ from sqlalchemy.engine import Engine
 import dotenv
 
 # Load .env if present
-dotenv.load_dotenv()  
-
+dotenv.load_dotenv()
 
 POSTGRES_URI = os.getenv(
     "POSTGRES_URI",
@@ -34,14 +21,12 @@ POSTGRES_URI = os.getenv(
     "postgresql+psycopg2://user:password@host:5432/dbname"
 )
 
-SCHEMA = os.getenv("SCHEMA", None)               
+SCHEMA = os.getenv("SCHEMA", None)
 TABLE_NAME = os.getenv("TABLE_NAME", "sampled_regimes")
 LABEL_COL  = os.getenv("LABEL_COL", "cluster")
 
 # Maximum rows the API will serve at once (safety cap)
 API_ROWS_CAP = int(os.getenv("API_ROWS_CAP", "50000"))
-
-
 
 def _append_conn_params(uri: str) -> str:
     # keepalives improve stability behind proxies; sslmode is required on many hosted PGs
@@ -62,7 +47,7 @@ ENGINE: Engine = make_engine()
 
 def fq_table(table: str, schema: Optional[str] = SCHEMA) -> str:
     """Fully-qualified table name with optional schema, safe-quoted."""
-    return f'"{schema}".\"{table}\"' if schema else f'"{table}"'
+    return f'"{schema}"."{table}"' if schema else f'"{table}"'
 
 def pg_columns(engine: Engine, table: str, schema: Optional[str] = SCHEMA) -> List[str]:
     """Return column names for a Postgres table (schema-aware)."""
@@ -107,7 +92,7 @@ def df_to_js_records(pdf: pd.DataFrame) -> Tuple[List[Dict[str, Any]], List[str]
         rows.append(rec)
     return rows, dt_cols
 
-
+# Flask app
 
 app = Flask(__name__)
 
@@ -118,7 +103,7 @@ def index() -> Response:
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>Regime Dashboard — Postgres API</title>
+  <title>Regime Dashboard </title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
   <style>
@@ -138,19 +123,30 @@ def index() -> Response:
     .stack {{ display: grid; gap: var(--gap); }}
 
     /* sticky so selectors remain visible while scrolling charts */
-    .sticky {{ position: sticky; top: 8px; z-index: 2; }}
+    .sticky {{ position: sticky; top: 8px; z-index: 2; background: #fff; }}
 
     /* XY selectors: 2 columns × 4 rows (max 8 pairs) */
     .xy-grid {{
       display: grid;
-      grid-template-columns: repeat(2, minmax(160px, 1fr));
-      gap: 8px 12px;
+      grid-template-columns: repeat(2, minmax(220px, 1fr));
+      gap: 12px;
     }}
     .xy-cell {{
       display: grid;
       grid-template-columns: 1fr 1fr;
-      gap: 6px;
+      gap: 8px;
       align-items: center;
+      border: 1px solid #cbd5e1;     /* clearer border around a pair */
+      border-radius: 8px;
+      padding: 10px;
+      background: #fafafa;
+    }}
+    .xy-label {{
+      grid-column: 1 / -1;
+      font-size: 12px;
+      color: #374151;
+      margin-bottom: 2px;
+      font-weight: 600;
     }}
 
     /* charts grid */
@@ -162,7 +158,7 @@ def index() -> Response:
   </style>
 </head>
 <body>
-  <div class="title">Regime Dashboard — Postgres API</div>
+  <div class="title">Regime Dashboard</div>
 
   <div class="card row">
     <div>
@@ -230,6 +226,17 @@ let GLOBAL = {{
   suptitle: "Regime Characteristics Over Time",
 }};
 
+/* Default axis helpers */
+function findPCAColumns(cols) {{
+  // Return PCA columns sorted by trailing index if possible (pca_component_1, pca_component_2, ...)
+  const pcs = cols.filter(c => /^pca_component_\\d+$/i.test(c));
+  return pcs.sort((a,b) => {{
+    const ia = parseInt(a.split("_").pop() || "0", 10);
+    const ib = parseInt(b.split("_").pop() || "0", 10);
+    return ia - ib;
+  }});
+}}
+
 function detectTypes(rows, exclude) {{
   if (!rows.length) return {{ numeric: [], datetime: [] }};
   const cols = Object.keys(rows[0]).filter(c => !exclude.has(c));
@@ -250,22 +257,37 @@ function detectTypes(rows, exclude) {{
   return {{ numeric, datetime }};
 }}
 
+function pickDefaultPair(i) {{
+  const cols = GLOBAL.axisOptions;
+  const hasImpl = cols.includes('impl_volatility');
+  const pcas = findPCAColumns(cols);
+  const yPCA = (pcas[i] || pcas[0] || cols[(i+1) % cols.length] || cols[0]);
+  const x = hasImpl ? 'impl_volatility' : (cols[i % cols.length] || cols[0]);
+  const y = yPCA;
+  return {{ x, y }};
+}}
+
 function buildXYSelectors() {{
   const grid = document.getElementById('xy-grid');
   grid.innerHTML = '';
   const maxPairs = 8;
   const k = Math.max(1, Math.min(Number(GLOBAL.windows) || 1, maxPairs));
   GLOBAL.xys = GLOBAL.xys.slice(0, k);
+
   while (GLOBAL.xys.length < k) {{
     const i = GLOBAL.xys.length;
-    const x = GLOBAL.axisOptions[i % GLOBAL.axisOptions.length] || GLOBAL.axisOptions[0];
-    const y = GLOBAL.axisOptions[(i+1) % GLOBAL.axisOptions.length] || GLOBAL.axisOptions[0];
-    GLOBAL.xys.push({{ x, y }});
+    const defPair = pickDefaultPair(i);
+    GLOBAL.xys.push(defPair);
   }}
 
   for (let i=0; i<k; i++) {{
     const cell = document.createElement('div');
     cell.className = 'xy-cell';
+
+    const label = document.createElement('div');
+    label.className = 'xy-label';
+    label.textContent = `Pair #${{i+1}}`;
+
     const xSel = document.createElement('select');
     const ySel = document.createElement('select');
 
@@ -277,6 +299,7 @@ function buildXYSelectors() {{
     xSel.addEventListener('change', () => {{ GLOBAL.xys[i].x = xSel.value; }});
     ySel.addEventListener('change', () => {{ GLOBAL.xys[i].y = ySel.value; }});
 
+    cell.appendChild(label);
     cell.appendChild(xSel);
     cell.appendChild(ySel);
     grid.appendChild(cell);
@@ -351,12 +374,9 @@ async function loadData() {{
 
   const k = Math.max(1, Math.min(8, Math.floor(GLOBAL.axisOptions.length / 2)));
   GLOBAL.windows = k;
-  GLOBAL.xys = [];
+  GLOBAL.xys = []; // rebuild pairs using defaults
   for (let i=0; i<k; i++) {{
-    GLOBAL.xys.push({{
-      x: GLOBAL.axisOptions[i % GLOBAL.axisOptions.length],
-      y: GLOBAL.axisOptions[(i+1) % GLOBAL.axisOptions.length],
-    }});
+    GLOBAL.xys.push(pickDefaultPair(i));
   }}
   document.getElementById('windows').value = String(k);
 
@@ -382,7 +402,6 @@ loadData();
 </html>
     """
     return Response(html, mimetype="text/html")
-
 
 @app.get("/api/data")
 def api_data() -> Response:

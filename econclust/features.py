@@ -28,10 +28,12 @@ def temporal_feature_engineering(df: pl.DataFrame, date_col: str) -> pl.DataFram
 
 def _prep_features(df: pl.DataFrame, feature_cols: List[str], standardize: bool = True,
                    dtype: np.dtype = np.float32) -> np.ndarray:
+    df = temporal_feature_engineering(df, date_col='date')
     X = (df.select([pl.col(c).cast(pl.Float32).fill_null(0.0) for c in feature_cols])
            .to_numpy().astype(dtype, copy=False))
     if standardize:
         X = StandardScaler(copy=False).fit_transform(X)
+    # add temporal features to numpy array X if needed
     return X
 
 def apply_pca_preprocessing(

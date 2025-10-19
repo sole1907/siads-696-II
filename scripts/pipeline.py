@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -25,12 +24,12 @@ from econclust import (
     lake_to_local,
     write_bytes_fs,
     downsample_dataframe,
+    temporal_feature_engineering
 )
 from econclust.viz import plot_k_scan_to_fs, plot_ward_scan_to_fs, plot_dendrogram_to_fs, export_comparison_plots
 
-# --------------------
 # Logging & path utils
-# --------------------
+
 def setup_logging(level: str = "INFO") -> None:
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
@@ -68,9 +67,8 @@ def resolve_out_paths(lake_root: str, local_root: str, run_name: str | None = No
     return lake_plots, local_frames, lake_frames, local_plots
 
 
-# -------------
 # Main pipeline
-# -------------
+
 def main():
     ap = argparse.ArgumentParser(description="Unified clustering pipeline")
     ap.add_argument("--config", type=str, default="configs/default.yml")
@@ -135,7 +133,6 @@ def main():
 
     # Merge all into one DataFrame
     df = pl.concat(dfs, how="vertical")
-    # df = pl.read_parquet(str(in_path))
 
     # Optional sampling
     if args.sample_size is not None and args.sample_size < df.height:
@@ -203,9 +200,7 @@ def main():
 
     summary = []
     
-    # ----------------
     # KMeans pipeline
-    # ----------------
     if args.algo in ("kmeans", "both"):
         logging.info("[KMeans] Auto-selecting k-range...")
         k_range = auto_k_range(df, feat_cols, max_cap=k_max)
@@ -342,10 +337,7 @@ def main():
         )
         logging.info("Saved Ward dendrogram plot to lake_dir=%s | local_dir=%s", lake_plots_dir, local_plots_dir)
 
-    # ---------------
     # Summary
-    # ---------------
-    # --- Save summary as CSV ---
     logging.info("Generating comparison summary and plots...")
 
     lake_frame_path=str(lake_frames_dir / f"{paths.output_prefix}_{suffix}_summary.csv")
